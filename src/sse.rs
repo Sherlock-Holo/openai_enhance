@@ -6,12 +6,15 @@ use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Serialize, Deserialize)]
-struct Delta {
-    pub content: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FinishReason {
     Stop,
     Length,
@@ -20,17 +23,20 @@ pub enum FinishReason {
     FunctionCall,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Choice {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Choice {
     pub index: i64,
     pub delta: Delta,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Chunk {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chunk {
     pub id: String,
     pub object: String,
     pub created: u32,

@@ -1,3 +1,6 @@
+#![feature(gen_blocks)]
+
+mod cot;
 mod sse;
 
 use std::collections::{HashMap, VecDeque};
