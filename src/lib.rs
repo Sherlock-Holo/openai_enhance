@@ -23,7 +23,7 @@ use axum::{
 use clap::Parser;
 use educe::Educe;
 use futures_util::{FutureExt, TryStreamExt, select};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tiktoken_rs::{CoreBPE, Rank, o200k_base};
@@ -43,7 +43,7 @@ use crate::sse::send_stream_request;
 #[derive(Educe)]
 #[educe(Debug)]
 struct ServerState {
-    backend: String,
+    backend: Url,
     client: Client,
     input_max_token: Option<usize>,
     #[educe(Debug(ignore))]
@@ -228,12 +228,16 @@ async fn forward_request<T: Serialize + 'static>(
     body: T,
 ) -> Result<Response, (StatusCode, String)> {
     headers = retain_headers(headers);
-    let target_url = format!("{}{path}", state.backend);
+
+    let url = state
+        .backend
+        .join(path)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     if streaming {
         match state.cot_parser {
             Some(CotParser::Deepseek) => {
-                return match send_stream_request(state.client.clone(), &target_url, body).await {
+                return match send_stream_request(state.client.clone(), url, body).await {
                     Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
 
                     Ok(sse_stream_response) => {
@@ -257,7 +261,7 @@ async fn forward_request<T: Serialize + 'static>(
 
     match state
         .client
-        .request(method, &target_url)
+        .request(method, url)
         .headers(headers)
         .json(&body)
         .send()
@@ -357,7 +361,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(handle_chat))
         .fallback(any(proxy_handler))
         .with_state(Arc::new(ServerState {
-            backend: cli.backend,
+            backend: cli.backend.parse()?,
             client: Default::default(),
             input_max_token: cli.input_max_token,
             bpe,

@@ -49,10 +49,10 @@ pub struct Chunk {
 
 pub async fn send_stream_request<T: Serialize>(
     client: Client,
-    url: &str,
+    url: Url,
     body: T,
 ) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + use<T>> {
-    let request = Request::new(Method::POST, Url::parse(url)?);
+    let request = Request::new(Method::POST, url);
     let builder = RequestBuilder::from_parts(client, request)
         .header("Content-Type", "application/json")
         .json(&body);
