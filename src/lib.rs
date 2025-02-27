@@ -22,12 +22,13 @@ use axum::{
 };
 use clap::Parser;
 use educe::Educe;
-use futures_util::TryStreamExt;
+use futures_util::{FutureExt, TryStreamExt, select};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tiktoken_rs::{CoreBPE, Rank, o200k_base};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{self, SignalKind};
 use tracing::level_filters::LevelFilter;
 use tracing::{info, instrument, subscriber};
 use tracing_subscriber::filter::Targets;
@@ -362,9 +363,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(cli.listen).await?;
 
-    axum::serve(listener, app).await?;
+    select! {
+        res = axum::serve(listener, app).into_future().fuse() => res?,
+        _ = signal_stop().fuse() => {}
+    }
 
     Ok(())
+}
+
+async fn signal_stop() {
+    let mut term = unix::signal(SignalKind::terminate()).unwrap();
+    let mut interrupt = unix::signal(SignalKind::interrupt()).unwrap();
+
+    select! {
+        _ = term.recv().fuse() => {}
+        _ = interrupt.recv().fuse() => {}
+    }
 }
 
 fn init_log(debug: bool) {
