@@ -1,5 +1,7 @@
 #![feature(gen_blocks)]
+#![feature(async_iterator)]
 
+mod adapter;
 mod cot;
 mod sse;
 
@@ -10,7 +12,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::Uri;
-use axum::response::Response;
+use axum::response::sse::Event;
+use axum::response::{IntoResponse, Response, Sse};
 use axum::{
     Json, Router,
     http::{HeaderMap, Method, StatusCode, header},
@@ -19,6 +22,7 @@ use axum::{
 use clap::Parser;
 use clap::builder::styling;
 use educe::Educe;
+use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +33,10 @@ use tracing::{info, instrument, subscriber};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{Registry, fmt};
+
+use crate::adapter::StreamAsyncIterAdapter;
+use crate::cot::deepseek;
+use crate::sse::send_stream_request;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -169,7 +177,15 @@ async fn handle_completion(
         state.max_token,
     );
 
-    forward_request(state, "/v1/completions", Method::POST, headers, payload).await
+    forward_request(
+        state,
+        "/v1/completions",
+        Method::POST,
+        headers,
+        payload.stream.unwrap_or_default(),
+        payload,
+    )
+    .await
 }
 
 #[instrument(err(Debug))]
@@ -189,21 +205,39 @@ async fn handle_chat(
         "/v1/chat/completions",
         Method::POST,
         headers,
+        payload.stream.unwrap_or_default(),
         payload,
     )
     .await
 }
 
 #[instrument(err(Debug), skip(body))]
-async fn forward_request<T: Serialize>(
+async fn forward_request<T: Serialize + 'static>(
     state: State<Arc<ServerState>>,
     path: &str,
     method: Method,
     mut headers: HeaderMap,
+    streaming: bool,
     body: T,
 ) -> Result<Response, (StatusCode, String)> {
     headers = retain_headers(headers);
     let target_url = format!("{}{path}", state.backend);
+
+    if streaming {
+        return match send_stream_request(state.client.clone(), &target_url, body).await {
+            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+
+            Ok(sse_stream_response) => {
+                let chunks = deepseek::extract_cot(sse_stream_response);
+                let adapter = StreamAsyncIterAdapter(chunks)
+                    .and_then(async |chunk| Ok(Event::default().json_data(chunk)?));
+
+                let sse = Sse::new(adapter);
+
+                Ok(sse.into_response())
+            }
+        };
+    }
 
     match state
         .client

@@ -6,6 +6,8 @@ use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const END_SSE_DATA: &str = "[DONE]";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15,6 +17,7 @@ pub struct Delta {
 }
 
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
     Length,
@@ -44,11 +47,11 @@ pub struct Chunk {
     pub choices: Vec<Choice>,
 }
 
-async fn send_stream_request<T: Serialize>(
+pub async fn send_stream_request<T: Serialize>(
     client: Client,
     url: &str,
     body: T,
-) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>>> {
+) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + use<T>> {
     let request = Request::new(Method::POST, Url::parse(url)?);
     let builder = RequestBuilder::from_parts(client, request)
         .header("Content-Type", "application/json")
@@ -63,7 +66,7 @@ async fn send_stream_request<T: Serialize>(
                 Event::Message(event) => Ok(Some(event)),
             })
         })
-        .try_take_while(|event| ready(Ok(event.data != "[DONE]")))
+        .try_take_while(|event| ready(Ok(event.data != END_SSE_DATA)))
         .map_err(anyhow::Error::from)
         .and_then(async |event| Ok(serde_json::from_str::<Chunk>(&event.data)?));
 

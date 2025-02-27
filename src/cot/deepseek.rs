@@ -63,33 +63,42 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                             }
 
                             Some(content) => {
-                                // for too short cot
-                                if content.contains(THINK_END_TAG) {
-                                    state = ThinkTagState::End;
+                                if !content.contains(THINK_END_TAG) {
+                                    state = ThinkTagState::Begin;
 
-                                    // ["reasoning_content", "content"]
-                                    let mut split_contents = content.splitn(2, THINK_END_TAG);
-                                    let reasoning_content =
-                                        split_contents.next().unwrap().to_string();
-
-                                    let mut reasoning_chunk = chunk.clone();
-                                    reasoning_chunk.choices[0].delta = Delta {
-                                        reasoning_content: Some(reasoning_content),
+                                    chunk.choices[0].delta = Delta {
+                                        reasoning_content: Some(content.to_string()),
                                         content: None,
                                     };
 
-                                    yield Ok(reasoning_chunk);
+                                    yield Ok(chunk);
+                                    continue;
+                                }
 
-                                    match split_contents.next() {
-                                        Some(content) => {
-                                            chunk.choices[0].delta = Delta {
-                                                reasoning_content: None,
-                                                content: Some(content.to_string()),
-                                            };
-                                        }
+                                // for too short cot
+                                state = ThinkTagState::End;
 
-                                        None => continue,
+                                // ["reasoning_content", "content"]
+                                let mut split_contents = content.splitn(2, THINK_END_TAG);
+                                let reasoning_content = split_contents.next().unwrap().to_string();
+
+                                let mut reasoning_chunk = chunk.clone();
+                                reasoning_chunk.choices[0].delta = Delta {
+                                    reasoning_content: Some(reasoning_content),
+                                    content: None,
+                                };
+
+                                yield Ok(reasoning_chunk);
+
+                                match split_contents.next() {
+                                    Some(content) => {
+                                        chunk.choices[0].delta = Delta {
+                                            reasoning_content: None,
+                                            content: Some(content.to_string()),
+                                        };
                                     }
+
+                                    None => continue,
                                 }
 
                                 yield Ok(chunk);
