@@ -30,7 +30,7 @@ use tiktoken_rs::{CoreBPE, Rank, o200k_base};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
 use tracing::level_filters::LevelFilter;
-use tracing::{info, instrument, subscriber};
+use tracing::{error, info, instrument, subscriber};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{Registry, fmt};
@@ -239,7 +239,10 @@ async fn forward_request<T: Serialize + 'static>(
                     Ok(sse_stream_response) => {
                         let chunks = deepseek::extract_cot(sse_stream_response);
                         let adapter = StreamAsyncIterAdapter(chunks)
-                            .and_then(async |chunk| Ok(Event::default().json_data(chunk)?));
+                            .and_then(async |chunk| Ok(Event::default().json_data(chunk)?))
+                            .inspect_err(|err| {
+                                error!(%err, "sse stream error happened");
+                            });
 
                         let sse = Sse::new(adapter);
 
