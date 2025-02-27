@@ -2,6 +2,7 @@
 #![feature(async_iterator)]
 
 mod adapter;
+mod cli;
 mod cot;
 mod sse;
 
@@ -20,7 +21,6 @@ use axum::{
     routing::{any, post},
 };
 use clap::Parser;
-use clap::builder::styling;
 use educe::Educe;
 use futures_util::TryStreamExt;
 use reqwest::Client;
@@ -35,6 +35,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{Registry, fmt};
 
 use crate::adapter::StreamAsyncIterAdapter;
+use crate::cli::{Cli, CotParser};
 use crate::cot::deepseek;
 use crate::sse::send_stream_request;
 
@@ -43,9 +44,10 @@ use crate::sse::send_stream_request;
 struct ServerState {
     backend: String,
     client: Client,
-    max_token: usize,
+    input_max_token: Option<usize>,
     #[educe(Debug(ignore))]
     bpe: CoreBPE,
+    cot_parser: Option<CotParser>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -171,11 +173,13 @@ async fn handle_completion(
     headers: HeaderMap,
     Json(mut payload): Json<CompletionRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    truncate_messages(
-        &state.bpe,
-        MessageType::Single(&mut payload.prompt),
-        state.max_token,
-    );
+    if let Some(max_token) = state.input_max_token {
+        truncate_messages(
+            &state.bpe,
+            MessageType::Single(&mut payload.prompt),
+            max_token,
+        );
+    }
 
     forward_request(
         state,
@@ -194,11 +198,13 @@ async fn handle_chat(
     headers: HeaderMap,
     Json(mut payload): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    truncate_messages(
-        &state.bpe,
-        MessageType::Multiple(&mut payload.messages),
-        state.max_token,
-    );
+    if let Some(max_token) = state.input_max_token {
+        truncate_messages(
+            &state.bpe,
+            MessageType::Multiple(&mut payload.messages),
+            max_token,
+        );
+    }
 
     forward_request(
         state,
@@ -224,19 +230,25 @@ async fn forward_request<T: Serialize + 'static>(
     let target_url = format!("{}{path}", state.backend);
 
     if streaming {
-        return match send_stream_request(state.client.clone(), &target_url, body).await {
-            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        match state.cot_parser {
+            Some(CotParser::Deepseek) => {
+                return match send_stream_request(state.client.clone(), &target_url, body).await {
+                    Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
 
-            Ok(sse_stream_response) => {
-                let chunks = deepseek::extract_cot(sse_stream_response);
-                let adapter = StreamAsyncIterAdapter(chunks)
-                    .and_then(async |chunk| Ok(Event::default().json_data(chunk)?));
+                    Ok(sse_stream_response) => {
+                        let chunks = deepseek::extract_cot(sse_stream_response);
+                        let adapter = StreamAsyncIterAdapter(chunks)
+                            .and_then(async |chunk| Ok(Event::default().json_data(chunk)?));
 
-                let sse = Sse::new(adapter);
+                        let sse = Sse::new(adapter);
 
-                Ok(sse.into_response())
+                        Ok(sse.into_response())
+                    }
+                };
             }
-        };
+
+            None => {}
+        }
     }
 
     match state
@@ -328,38 +340,12 @@ async fn proxy_handler(
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
-const STYLES: styling::Styles = styling::Styles::styled()
-    .header(styling::AnsiColor::Green.on_default().bold())
-    .usage(styling::AnsiColor::Green.on_default().bold())
-    .literal(styling::AnsiColor::Blue.on_default().bold())
-    .placeholder(styling::AnsiColor::Cyan.on_default());
-
-#[derive(Debug, Parser)]
-#[command(styles = STYLES)]
-struct Cli {
-    #[arg(short, long)]
-    /// listen addr
-    listen: String,
-
-    #[arg(short, long)]
-    /// backend addr
-    backend: String,
-
-    #[arg(short, long, default_value_t = 8192)]
-    /// max token
-    max_token: usize,
-
-    #[arg(short, long)]
-    /// enable debug log
-    debug: bool,
-}
-
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     init_log(cli.debug);
 
-    info!("starting openai limiter, max token {}", cli.max_token);
+    info!("starting openai limiter");
 
     let bpe = o200k_base()?;
     let app = Router::new()
@@ -369,8 +355,9 @@ pub async fn run() -> anyhow::Result<()> {
         .with_state(Arc::new(ServerState {
             backend: cli.backend,
             client: Default::default(),
-            max_token: cli.max_token,
+            input_max_token: cli.input_max_token,
             bpe,
+            cot_parser: cli.cot_parser,
         }));
 
     let listener = TcpListener::bind(cli.listen).await?;
