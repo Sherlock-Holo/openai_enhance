@@ -1,3 +1,5 @@
+mod sse;
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
