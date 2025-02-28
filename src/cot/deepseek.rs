@@ -10,7 +10,7 @@ const THINK_END_TAG: &str = "</think>";
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 enum ThinkTagState {
     Init,
-    Begin,
+    Begin { trimmed_follow_new_line: bool }, // for some
     End,
     NoTag,
 }
@@ -38,6 +38,21 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
 
         let delta = &chunk.choices[0].delta;
 
+        // skip empty chunk
+        if delta
+            .reasoning_content
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or_default()
+            && delta
+                .content
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or_default()
+        {
+            continue;
+        }
+
         match state {
             ThinkTagState::Init => {
                 if delta.reasoning_content.is_some() {
@@ -62,10 +77,20 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                                 continue;
                             }
 
-                            Some(content) => {
-                                if !content.contains(THINK_END_TAG) {
-                                    state = ThinkTagState::Begin;
+                            Some(mut content) => {
+                                state = ThinkTagState::Begin {
+                                    trimmed_follow_new_line: false,
+                                };
 
+                                let trimmed_content = content.trim_start();
+                                if trimmed_content != content {
+                                    content = trimmed_content;
+                                    state = ThinkTagState::Begin {
+                                        trimmed_follow_new_line: true,
+                                    };
+                                }
+
+                                if !content.contains(THINK_END_TAG) {
                                     chunk.choices[0].delta = Delta {
                                         reasoning_content: Some(content.to_string()),
                                         content: None,
@@ -94,7 +119,7 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                                     Some(content) => {
                                         chunk.choices[0].delta = Delta {
                                             reasoning_content: None,
-                                            content: Some(content.to_string()),
+                                            content: Some(content.trim_start().to_string()),
                                         };
                                     }
 
@@ -108,12 +133,23 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                 }
             }
 
-            ThinkTagState::Begin => {
+            ThinkTagState::Begin {
+                trimmed_follow_new_line,
+            } => {
                 // ignore found think tag but content is null case, let client handle it
                 if let Some(content) = &delta.content {
                     if !content.contains(THINK_END_TAG) {
-                        chunk.choices[0].delta.reasoning_content =
-                            chunk.choices[0].delta.content.take();
+                        let mut content = chunk.choices[0].delta.content.take();
+                        if let Some(content) = content.as_mut() {
+                            if !trimmed_follow_new_line {
+                                state = ThinkTagState::Begin {
+                                    trimmed_follow_new_line: true,
+                                };
+                                *content = content.trim_start().to_string();
+                            }
+                        }
+
+                        chunk.choices[0].delta.reasoning_content = content;
 
                         yield Ok(chunk);
                         continue;
