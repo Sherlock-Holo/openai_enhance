@@ -357,8 +357,14 @@ pub async fn run() -> anyhow::Result<()> {
 
     let bpe = o200k_base()?;
     let app = Router::new()
-        .route("/v1/completions", post(handle_completion))
-        .route("/v1/chat/completions", post(handle_chat))
+        .route(
+            "/v1/completions",
+            post(handle_completion).fallback(proxy_handler),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(handle_chat).fallback(proxy_handler),
+        )
         .fallback(any(proxy_handler))
         .with_state(Arc::new(ServerState {
             backend: cli.backend.parse()?,
