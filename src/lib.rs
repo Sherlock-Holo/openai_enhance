@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::{
     Json, Router,
     http::{HeaderMap, Method, StatusCode, header},
-    routing::{any, post},
+    routing::post,
 };
 use clap::Parser;
 use educe::Educe;
@@ -308,16 +308,18 @@ fn retain_headers(headers: HeaderMap) -> HeaderMap {
 async fn proxy_handler(
     state: State<Arc<ServerState>>,
     method: Method,
-    uri: Uri,
+    req_uri: Uri,
     mut headers: HeaderMap,
     body: Body,
 ) -> Result<Response, (StatusCode, String)> {
     headers = retain_headers(headers);
-    let target_url = format!("{}{}", state.backend, uri.path());
+
+    let mut url = state.backend.clone();
+    url.set_path(req_uri.path());
 
     let response = match state
         .client
-        .request(method, &target_url)
+        .request(method, url)
         .headers(headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream()))
         .send()
@@ -375,7 +377,7 @@ pub async fn run() -> anyhow::Result<()> {
             "/v1/chat/completions",
             post(handle_chat).fallback(proxy_handler),
         )
-        .fallback(any(proxy_handler))
+        .fallback(proxy_handler)
         .layer(cors)
         .with_state(Arc::new(ServerState {
             backend: cli.backend.parse()?,
