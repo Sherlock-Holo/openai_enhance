@@ -29,6 +29,7 @@ use serde_json::Value;
 use tiktoken_rs::{CoreBPE, Rank, o200k_base};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
+use tower_http::cors::{AllowHeaders, AllowPrivateNetwork, Any, CorsLayer};
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info, instrument, subscriber};
 use tracing_subscriber::filter::Targets;
@@ -356,6 +357,15 @@ pub async fn run() -> anyhow::Result<()> {
     info!("starting openai limiter");
 
     let bpe = o200k_base()?;
+
+    let cors = CorsLayer::new()
+        // allow `GET` and `POST` when accessing the resource
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(AllowHeaders::any())
+        .allow_private_network(AllowPrivateNetwork::yes())
+        // allow requests from any origin
+        .allow_origin(Any);
+
     let app = Router::new()
         .route(
             "/v1/completions",
@@ -366,6 +376,7 @@ pub async fn run() -> anyhow::Result<()> {
             post(handle_chat).fallback(proxy_handler),
         )
         .fallback(any(proxy_handler))
+        .layer(cors)
         .with_state(Arc::new(ServerState {
             backend: cli.backend.parse()?,
             client: Default::default(),
