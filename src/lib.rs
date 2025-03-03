@@ -5,8 +5,8 @@ mod adapter;
 mod cli;
 mod cot;
 mod sse;
+mod types;
 
-use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 
@@ -24,9 +24,8 @@ use clap::Parser;
 use educe::Educe;
 use futures_util::{FutureExt, TryStreamExt, select};
 use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tiktoken_rs::{CoreBPE, Rank, o200k_base};
+use serde::Serialize;
+use tiktoken_rs::{CoreBPE, o200k_base};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
 use tower_http::cors::{AllowHeaders, AllowPrivateNetwork, Any, CorsLayer};
@@ -40,6 +39,8 @@ use crate::adapter::StreamAsyncIterAdapter;
 use crate::cli::{Cli, CotParser};
 use crate::cot::deepseek;
 use crate::sse::send_stream_request;
+use crate::types::request::chat::CreateChatCompletionRequest;
+use crate::types::request::completion::CreateCompletionRequest;
 
 #[derive(Educe)]
 #[educe(Debug)]
@@ -52,136 +53,189 @@ struct ServerState {
     cot_parser: Option<CotParser>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct CompletionRequest {
-    model: String,
-    prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
+// #[derive(Debug, Deserialize, Serialize)]
+// struct CompletionRequest {
+// model: String,
+// prompt: String,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// max_tokens: Option<usize>,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// temperature: Option<f64>,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// stream: Option<bool>,
+//
+// #[serde(flatten)]
+// other_fields: HashMap<String, Value>,
+// }
+//
+// #[derive(Debug, Deserialize, Serialize)]
+// struct ChatCompletionRequest {
+// model: String,
+// messages: VecDeque<Message>,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// max_tokens: Option<usize>,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// temperature: Option<f64>,
+// #[serde(skip_serializing_if = "Option::is_none")]
+// stream: Option<bool>,
+// }
+//
+// #[derive(Debug, Deserialize, Serialize, Ord, PartialOrd, Eq, PartialEq, Copy,
+// Clone, Hash)] #[serde(rename_all = "lowercase")]
+// enum Role {
+// Developer,
+// System,
+// User,
+// Assistant,
+// Tool,
+// Function,
+// }
+//
+// impl Role {
+// const fn can_truncate(&self) -> bool {
+// matches!(self, Role::Developer | Role::Assistant | Role::User)
+// }
+// }
+//
+// #[derive(Debug, Deserialize, Serialize)]
+// struct Message {
+// role: Role,
+// content: String,
+//
+// #[serde(flatten)]
+// other_fields: HashMap<String, Value>,
+// }
+//
+// #[derive(Debug, Deserialize, Serialize, Ord, PartialOrd, Eq, PartialEq, Copy,
+// Clone, Hash)] enum ToolType {
+// Function,
+// }
+//
+// #[derive(Debug, Deserialize, Serialize)]
+// struct FunctionCall {
+// name: Option<String>,
+// arguments: Option<String>,
+// }
+//
+// #[derive(Debug, Deserialize, Serialize)]
+// struct ToolCall {
+// index: u32,
+// id: Option<String>,
+// r#type: Option<ToolType>,
+// function: Option<FunctionCall>,
+// }
 
-    #[serde(flatten)]
-    other_fields: HashMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: VecDeque<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-enum MessageType<'a> {
-    Single(&'a mut String),
-    Multiple(&'a mut VecDeque<Message>),
-}
-
-fn truncate_messages(bpe: &CoreBPE, messages: MessageType, max_token: usize) {
-    match messages {
-        MessageType::Single(message) => {
-            let tokens = bpe.encode_with_special_tokens(message);
-            if tokens.len() <= max_token {
-                return;
-            }
-
-            info!(
-                tokens_len = tokens.len(),
-                max_token, "truncating single message"
-            );
-
-            truncate_message(bpe, max_token, message, tokens);
-        }
-
-        MessageType::Multiple(messages) => {
-            let mut token_list = messages
-                .iter()
-                .map(|message| bpe.encode_with_special_tokens(&message.content))
-                .collect::<VecDeque<_>>();
-
-            let mut sum = token_list.iter().map(|tokens| tokens.len()).sum::<usize>();
-            if sum <= max_token {
-                return;
-            }
-
-            while sum > max_token {
-                assert!(!token_list.is_empty());
-
-                let token_len = token_list[0].len();
-                if sum - token_len > max_token {
-                    if token_list.len() > 1 {
-                        sum -= token_len;
-                        messages.pop_front();
-                        token_list.pop_front();
-
-                        info!("drop front message");
-
-                        continue;
-                    }
-
-                    info!(sum, max_token, "truncating multiple message to single");
-
-                    return truncate_messages(
-                        bpe,
-                        MessageType::Single(&mut messages[0].content),
-                        max_token,
-                    );
-                }
-
-                let new_len = sum - max_token;
-                let tokens = token_list.pop_front().unwrap();
-
-                info!(
-                    sum,
-                    max_token,
-                    new_front_len = new_len,
-                    "truncating front multiple message"
-                );
-
-                truncate_message(bpe, new_len, &mut messages[0].content, tokens);
-
-                return;
-            }
-        }
-    }
-}
-
-fn truncate_message(bpe: &CoreBPE, max_token: usize, content: &mut String, tokens: Vec<Rank>) {
-    let mut tokens = VecDeque::from(tokens);
-    tokens.drain(..max_token);
-    content.clear();
-
-    for data in bpe._decode_native_and_split(tokens.into()) {
-        content.push_str(&String::from_utf8_lossy(&data));
-    }
-}
+// enum MessageType<'a> {
+// Single(&'a mut String),
+// Multiple(&'a mut VecDeque<Message>),
+// }
+//
+// fn truncate_messages(bpe: &CoreBPE, messages: MessageType, max_token: usize)
+// { match messages {
+// MessageType::Single(message) => {
+// let tokens = bpe.encode_with_special_tokens(message);
+// if tokens.len() <= max_token {
+// return;
+// }
+//
+// info!(
+// tokens_len = tokens.len(),
+// max_token, "truncating single message"
+// );
+//
+// truncate_message(bpe, max_token, message, tokens);
+// }
+//
+// MessageType::Multiple(messages) => {
+// let mut token_list = messages
+// .iter()
+// .map(|message| bpe.encode_with_special_tokens(&message.content))
+// .collect::<VecDeque<_>>();
+//
+// let mut sum = token_list.iter().map(|tokens| tokens.len()).sum::<usize>();
+// if sum <= max_token {
+// return;
+// }
+//
+// let mut index = 0;
+// while sum > max_token {
+// assert!(!token_list.is_empty());
+//
+// avoid break system or tool call
+// if !messages[index].role.can_truncate() {
+// index += 1;
+//
+// no more message can be truncated
+// if index >= messages.len() {
+// return;
+// }
+//
+// continue;
+// }
+//
+// let token_len = token_list[index].len();
+// if sum - token_len > max_token {
+// if token_list.len() > 1 {
+// sum -= token_len;
+// messages.remove(index);
+// token_list.remove(index);
+//
+// info!(index, "drop message");
+//
+// continue;
+// }
+//
+// info!(sum, max_token, "truncating multiple message to single");
+//
+// return truncate_messages(
+// bpe,
+// MessageType::Single(&mut messages[index].content),
+// max_token,
+// );
+// }
+//
+// let new_len = sum - max_token;
+// let tokens = token_list.remove(index).unwrap();
+//
+// info!(
+// index,
+// sum,
+// max_token,
+// new_front_len = new_len,
+// "truncating multiple message"
+// );
+//
+// truncate_message(bpe, new_len, &mut messages[index].content, tokens);
+//
+// return;
+// }
+// }
+// }
+// }
+//
+// fn truncate_message(bpe: &CoreBPE, max_token: usize, content: &mut String,
+// tokens: Vec<Rank>) { let mut tokens = VecDeque::from(tokens);
+// tokens.drain(..max_token);
+// content.clear();
+//
+// for data in bpe._decode_native_and_split(tokens.into()) {
+// content.push_str(&String::from_utf8_lossy(&data));
+// }
+// }
 
 #[instrument(err(Debug))]
 async fn handle_completion(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(mut payload): Json<CompletionRequest>,
+    Json(payload): Json<CreateCompletionRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Some(max_token) = state.input_max_token {
-        truncate_messages(
-            &state.bpe,
-            MessageType::Single(&mut payload.prompt),
-            max_token,
-        );
-    }
+    // if let Some(max_token) = state.input_max_token {
+    // truncate_messages(
+    // &state.bpe,
+    // MessageType::Single(&mut payload.prompt),
+    // max_token,
+    // );
+    // }
 
     forward_request(
         state,
@@ -198,15 +252,15 @@ async fn handle_completion(
 async fn handle_chat(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(mut payload): Json<ChatCompletionRequest>,
+    Json(payload): Json<CreateChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Some(max_token) = state.input_max_token {
-        truncate_messages(
-            &state.bpe,
-            MessageType::Multiple(&mut payload.messages),
-            max_token,
-        );
-    }
+    // if let Some(max_token) = state.input_max_token {
+    // truncate_messages(
+    // &state.bpe,
+    // MessageType::Multiple(&mut payload.messages),
+    // max_token,
+    // );
+    // }
 
     forward_request(
         state,
