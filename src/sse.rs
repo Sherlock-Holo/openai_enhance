@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::future::ready;
 
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Client, Method, Request, RequestBuilder, Url};
-use reqwest_eventsource::{Event, EventSource};
+use reqwest_eventsource::{Error, Event, EventSource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -42,9 +43,12 @@ pub struct Choice {
 pub struct Chunk {
     pub id: String,
     pub object: String,
-    pub created: u32,
+    pub created: usize,
     pub model: String,
     pub choices: Vec<Choice>,
+
+    #[serde(flatten)]
+    other_fields: HashMap<String, Value>,
 }
 
 pub async fn send_stream_request<T: Serialize>(
@@ -66,7 +70,14 @@ pub async fn send_stream_request<T: Serialize>(
                 Event::Message(event) => Ok(Some(event)),
             })
         })
-        .try_take_while(|event| ready(Ok(event.data != END_SSE_DATA)))
+        .take_while(|event| {
+            let should_continue = match event {
+                Err(err) => !matches!(err, Error::StreamEnded),
+                Ok(event) => event.data != END_SSE_DATA,
+            };
+
+            ready(should_continue)
+        })
         .map_err(anyhow::Error::from)
         .and_then(async |event| Ok(serde_json::from_str::<Chunk>(&event.data)?));
 
