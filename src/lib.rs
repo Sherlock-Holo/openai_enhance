@@ -10,6 +10,7 @@ mod types;
 use std::io;
 use std::sync::Arc;
 
+use async_openai::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::Uri;
@@ -39,8 +40,6 @@ use crate::adapter::StreamAsyncIterAdapter;
 use crate::cli::{Cli, CotParser};
 use crate::cot::deepseek;
 use crate::sse::send_stream_request;
-use crate::types::request::chat::CreateChatCompletionRequest;
-use crate::types::request::completion::CreateCompletionRequest;
 
 #[derive(Educe)]
 #[educe(Debug)]
