@@ -11,7 +11,7 @@ use std::io;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::Uri;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
@@ -432,6 +432,7 @@ pub async fn run() -> anyhow::Result<()> {
             post(handle_chat).fallback(proxy_handler),
         )
         .fallback(proxy_handler)
+        .layer(DefaultBodyLimit::disable())
         .layer(cors)
         .with_state(Arc::new(ServerState {
             backend: cli.backend.parse()?,
