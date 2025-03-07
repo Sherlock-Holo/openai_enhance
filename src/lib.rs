@@ -1,11 +1,12 @@
 #![feature(gen_blocks)]
 #![feature(async_iterator)]
+#![feature(async_for_loop)]
 
 mod adapter;
 mod cli;
 mod cot;
+mod ext_types;
 mod sse;
-mod types;
 
 use std::fmt::Debug;
 use std::io;
@@ -478,7 +479,10 @@ fn init_log(debug: bool) {
     let targets = Targets::new()
         .with_default(LevelFilter::DEBUG)
         .with_target("hickory_resolver", LevelFilter::OFF);
-    let layered = Registry::default().with(targets).with(layer).with(level);
 
-    layered.init();
+    Registry::default()
+        .with(targets)
+        .with(layer)
+        .with(level)
+        .init();
 }

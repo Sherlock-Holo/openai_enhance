@@ -1,85 +1,47 @@
-use std::collections::HashMap;
-use std::future::ready;
+use std::async_iter::AsyncIterator;
 
-use futures_util::{Stream, StreamExt, TryStreamExt};
-use reqwest::{Client, Method, Request, RequestBuilder, Url};
+use reqwest::{Client, Method, Request, RequestBuilder, Url, header};
 use reqwest_eventsource::{Error, Event, EventSource};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
+
+use crate::adapter::StreamAsyncIterAdapter;
+use crate::ext_types::chat::CreateChatCompletionStreamResponse;
 
 const END_SSE_DATA: &str = "[DONE]";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Delta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FinishReason {
-    Stop,
-    Length,
-    ToolCalls,
-    ContentFilter,
-    FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Choice {
-    pub index: i64,
-    pub delta: Delta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logprobs: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<FinishReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Chunk {
-    pub id: String,
-    pub object: String,
-    pub created: usize,
-    pub model: String,
-    pub choices: Vec<Choice>,
-
-    #[serde(flatten)]
-    other_fields: HashMap<String, Value>,
-}
 
 pub async fn send_stream_request<T: Serialize>(
     client: Client,
     url: Url,
     body: T,
-) -> anyhow::Result<impl Stream<Item = anyhow::Result<Chunk>> + use<T>> {
+) -> anyhow::Result<
+    impl AsyncIterator<Item = anyhow::Result<CreateChatCompletionStreamResponse>> + use<T>,
+> {
     let request = Request::new(Method::POST, url);
     let builder = RequestBuilder::from_parts(client, request)
-        .header("Content-Type", "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
         .json(&body);
 
     let event_source = EventSource::new(builder)?;
 
-    let stream = event_source
-        .try_filter_map(|event| {
-            ready(match event {
-                Event::Open => Ok(None),
-                Event::Message(event) => Ok(Some(event)),
-            })
-        })
-        .take_while(|event| {
-            let should_continue = match event {
-                Err(err) => !matches!(err, Error::StreamEnded),
-                Ok(event) => event.data != END_SSE_DATA,
-            };
-
-            ready(should_continue)
-        })
-        .map_err(anyhow::Error::from)
-        .and_then(async |event| Ok(serde_json::from_str::<Chunk>(&event.data)?));
+    let stream = async gen {
+        let event_source = StreamAsyncIterAdapter(event_source);
+        for await event in event_source {
+            match event {
+                Ok(Event::Message(event)) => {
+                    if event.data == END_SSE_DATA {
+                        break;
+                    }
+                    match serde_json::from_str::<CreateChatCompletionStreamResponse>(&event.data) {
+                        Ok(chunk) => yield Ok(chunk),
+                        Err(e) => yield Err(e.into()),
+                    }
+                }
+                Ok(Event::Open) => continue,
+                Err(Error::StreamEnded) => break,
+                Err(e) => yield Err(e.into()),
+            }
+        }
+    };
 
     Ok(stream)
 }

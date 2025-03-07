@@ -1,8 +1,6 @@
-use std::pin::pin;
+use std::async_iter::AsyncIterator;
 
-use futures_util::{Stream, StreamExt};
-
-use crate::sse::{Chunk, Delta};
+use crate::ext_types::chat::CreateChatCompletionStreamResponse;
 
 const THINK_BEGIN_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
@@ -15,13 +13,14 @@ enum ThinkTagState {
     NoTag,
 }
 
-pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
-    mut st: S,
-) -> anyhow::Result<Chunk> {
+pub async gen fn extract_cot<
+    S: AsyncIterator<Item = anyhow::Result<CreateChatCompletionStreamResponse>>,
+>(
+    st: S,
+) -> anyhow::Result<CreateChatCompletionStreamResponse> {
     let mut state = ThinkTagState::Init;
 
-    let mut st = pin!(st);
-    while let Some(chunk) = st.next().await {
+    for await chunk in st {
         let mut chunk = match chunk {
             Err(err) => {
                 yield Err(err);
@@ -91,10 +90,10 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                                 }
 
                                 if !content.contains(THINK_END_TAG) {
-                                    chunk.choices[0].delta = Delta {
-                                        reasoning_content: Some(content.to_string()),
-                                        content: None,
-                                    };
+                                    let reasoning_content = content.to_string();
+                                    chunk.choices[0].delta.reasoning_content =
+                                        Some(reasoning_content);
+                                    chunk.choices[0].delta.content = None;
 
                                     yield Ok(chunk);
                                     continue;
@@ -108,19 +107,17 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
                                 let reasoning_content = split_contents.next().unwrap().to_string();
 
                                 let mut reasoning_chunk = chunk.clone();
-                                reasoning_chunk.choices[0].delta = Delta {
-                                    reasoning_content: Some(reasoning_content),
-                                    content: None,
-                                };
+
+                                reasoning_chunk.choices[0].delta.reasoning_content =
+                                    Some(reasoning_content);
+                                reasoning_chunk.choices[0].delta.content = None;
 
                                 yield Ok(reasoning_chunk);
 
                                 match split_contents.next() {
                                     Some(content) => {
-                                        chunk.choices[0].delta = Delta {
-                                            reasoning_content: None,
-                                            content: Some(content.trim_start().to_string()),
-                                        };
+                                        chunk.choices[0].delta.content =
+                                            Some(content.trim_start().to_string());
                                     }
 
                                     None => continue,
@@ -159,22 +156,20 @@ pub async gen fn extract_cot<S: Stream<Item = anyhow::Result<Chunk>>>(
 
                     // ["reasoning_content", "content"]
                     let mut split_contents = content.splitn(2, THINK_END_TAG);
-                    let reasoning_content = split_contents.next().unwrap();
+                    let reasoning_content = split_contents.next().unwrap().to_string();
 
                     let mut reasoning_chunk = chunk.clone();
-                    reasoning_chunk.choices[0].delta = Delta {
-                        reasoning_content: Some(reasoning_content.to_string()),
-                        content: None,
-                    };
+
+                    reasoning_chunk.choices[0].delta.reasoning_content = Some(reasoning_content);
+                    reasoning_chunk.choices[0].delta.content = None;
 
                     yield Ok(reasoning_chunk);
 
                     match split_contents.next() {
                         Some(content) => {
-                            chunk.choices[0].delta = Delta {
-                                reasoning_content: None,
-                                content: Some(content.to_string()),
-                            };
+                            let content = content.to_string();
+                            chunk.choices[0].delta.reasoning_content = None;
+                            chunk.choices[0].delta.content = Some(content);
                         }
 
                         None => continue,
