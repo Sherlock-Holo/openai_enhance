@@ -7,6 +7,7 @@ mod cot;
 mod sse;
 mod types;
 
+use std::fmt::Debug;
 use std::io;
 use std::sync::Arc;
 
@@ -31,9 +32,10 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
 use tower_http::cors::{AllowHeaders, AllowPrivateNetwork, Any, CorsLayer};
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, instrument, subscriber};
+use tracing::{error, info, instrument};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Registry, fmt};
 
 use crate::adapter::StreamAsyncIterAdapter;
@@ -222,7 +224,7 @@ struct ServerState {
 // }
 // }
 
-#[instrument(err(Debug))]
+#[instrument(level = "debug", ret, err(Debug))]
 async fn handle_completion(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -247,7 +249,7 @@ async fn handle_completion(
     .await
 }
 
-#[instrument(err(Debug))]
+#[instrument(level = "debug", ret, err(Debug))]
 async fn handle_chat(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -272,8 +274,8 @@ async fn handle_chat(
     .await
 }
 
-#[instrument(err(Debug), skip(body))]
-async fn forward_request<T: Serialize + 'static>(
+#[instrument(level = "debug", ret, err(Debug))]
+async fn forward_request<T: Serialize + Debug + 'static>(
     state: State<Arc<ServerState>>,
     path: &str,
     method: Method,
@@ -478,5 +480,5 @@ fn init_log(debug: bool) {
         .with_target("hickory_resolver", LevelFilter::OFF);
     let layered = Registry::default().with(targets).with(layer).with(level);
 
-    subscriber::set_global_default(layered).unwrap();
+    layered.init();
 }
