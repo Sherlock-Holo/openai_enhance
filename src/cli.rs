@@ -16,11 +16,11 @@ pub enum CotParser {
 #[command(styles = STYLES)]
 pub struct Cli {
     #[arg(short, long)]
-    /// listen addr
+    /// Listening address
     pub listen: String,
 
     #[arg(short, long)]
-    /// backend addr
+    /// Backend server address
     pub backend: String,
 
     #[arg(short, long)]
@@ -31,6 +31,6 @@ pub struct Cli {
     pub cot_parser: Option<CotParser>,
 
     #[arg(short, long)]
-    /// enable debug log
+    /// Enable debug logging
     pub debug: bool,
 }
