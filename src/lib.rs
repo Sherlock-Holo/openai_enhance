@@ -1,12 +1,12 @@
 #![feature(gen_blocks)]
 #![feature(async_iterator)]
+#![feature(async_for_loop)]
 
 mod adapter;
 mod cli;
-mod cot;
 mod sse;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -21,174 +21,46 @@ use axum::{
     routing::post,
 };
 use clap::Parser;
-use educe::Educe;
-use futures_util::{FutureExt, TryStreamExt, select};
+use futures_util::{FutureExt, Stream, TryStreamExt, select};
 use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
-use tiktoken_rs::{CoreBPE, Rank, o200k_base};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
 use tower_http::cors::{AllowHeaders, AllowPrivateNetwork, Any, CorsLayer};
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, instrument, subscriber};
+use tracing::{debug, error, info, instrument, subscriber};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{Registry, fmt};
 
 use crate::adapter::StreamAsyncIterAdapter;
-use crate::cli::{Cli, CotParser};
-use crate::cot::deepseek;
-use crate::sse::send_stream_request;
+use crate::cli::Cli;
+use crate::sse::{Chunk, send_stream_request};
 
-#[derive(Educe)]
-#[educe(Debug)]
+#[derive(Debug)]
 struct ServerState {
     backend: Url,
     client: Client,
-    input_max_token: Option<usize>,
-    #[educe(Debug(ignore))]
-    bpe: CoreBPE,
-    cot_parser: Option<CotParser>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct CompletionRequest {
-    model: String,
-    prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-
-    #[serde(flatten)]
-    other_fields: HashMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: VecDeque<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-enum MessageType<'a> {
-    Single(&'a mut String),
-    Multiple(&'a mut VecDeque<Message>),
-}
-
-fn truncate_messages(bpe: &CoreBPE, messages: MessageType, max_token: usize) {
-    match messages {
-        MessageType::Single(message) => {
-            let tokens = bpe.encode_with_special_tokens(message);
-            if tokens.len() <= max_token {
-                return;
-            }
-
-            info!(
-                tokens_len = tokens.len(),
-                max_token, "truncating single message"
-            );
-
-            truncate_message(bpe, max_token, message, tokens);
-        }
-
-        MessageType::Multiple(messages) => {
-            let mut token_list = messages
-                .iter()
-                .map(|message| bpe.encode_with_special_tokens(&message.content))
-                .collect::<VecDeque<_>>();
-
-            let mut sum = token_list.iter().map(|tokens| tokens.len()).sum::<usize>();
-            if sum <= max_token {
-                return;
-            }
-
-            while sum > max_token {
-                assert!(!token_list.is_empty());
-
-                let token_len = token_list[0].len();
-                if sum - token_len > max_token {
-                    if token_list.len() > 1 {
-                        sum -= token_len;
-                        messages.pop_front();
-                        token_list.pop_front();
-
-                        info!("drop front message");
-
-                        continue;
-                    }
-
-                    info!(sum, max_token, "truncating multiple message to single");
-
-                    return truncate_messages(
-                        bpe,
-                        MessageType::Single(&mut messages[0].content),
-                        max_token,
-                    );
-                }
-
-                let new_len = sum - max_token;
-                let tokens = token_list.pop_front().unwrap();
-
-                info!(
-                    sum,
-                    max_token,
-                    new_front_len = new_len,
-                    "truncating front multiple message"
-                );
-
-                truncate_message(bpe, new_len, &mut messages[0].content, tokens);
-
-                return;
-            }
-        }
-    }
-}
-
-fn truncate_message(bpe: &CoreBPE, max_token: usize, content: &mut String, tokens: Vec<Rank>) {
-    let mut tokens = VecDeque::from(tokens);
-    tokens.drain(..max_token);
-    content.clear();
-
-    for data in bpe._decode_native_and_split(tokens.into()) {
-        content.push_str(&String::from_utf8_lossy(&data));
-    }
 }
 
 #[instrument(err(Debug))]
 async fn handle_completion(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(mut payload): Json<CompletionRequest>,
+    Json(payload): Json<HashMap<String, Value>>,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Some(max_token) = state.input_max_token {
-        truncate_messages(
-            &state.bpe,
-            MessageType::Single(&mut payload.prompt),
-            max_token,
-        );
-    }
+    let stream = payload
+        .get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or_default();
 
     forward_request(
         state,
-        "/v1/completions",
+        "v1/completions",
         Method::POST,
         headers,
-        payload.stream.unwrap_or_default(),
+        stream,
         payload,
     )
     .await
@@ -198,22 +70,19 @@ async fn handle_completion(
 async fn handle_chat(
     state: State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(mut payload): Json<ChatCompletionRequest>,
+    Json(payload): Json<HashMap<String, Value>>,
 ) -> Result<Response, (StatusCode, String)> {
-    if let Some(max_token) = state.input_max_token {
-        truncate_messages(
-            &state.bpe,
-            MessageType::Multiple(&mut payload.messages),
-            max_token,
-        );
-    }
+    let stream = payload
+        .get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or_default();
 
     forward_request(
         state,
-        "/v1/chat/completions",
+        "chat/completions",
         Method::POST,
         headers,
-        payload.stream.unwrap_or_default(),
+        stream,
         payload,
     )
     .await
@@ -236,28 +105,23 @@ async fn forward_request<T: Serialize + 'static>(
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     if streaming {
-        match state.cot_parser {
-            Some(CotParser::Deepseek) => {
-                return match send_stream_request(state.client.clone(), url, body).await {
-                    Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        return match send_stream_request(state.client.clone(), url, headers, body).await {
+            Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
 
-                    Ok(sse_stream_response) => {
-                        let chunks = deepseek::extract_cot(sse_stream_response);
-                        let adapter = StreamAsyncIterAdapter(chunks)
-                            .and_then(async |chunk| Ok(Event::default().json_data(chunk)?))
-                            .inspect_err(|err| {
-                                error!(%err, "sse stream error happened");
-                            });
+            Ok(sse_stream_response) => {
+                let resp_iter = StreamAsyncIterAdapter(supplement_tool_call_fields(
+                    StreamAsyncIterAdapter(sse_stream_response),
+                ))
+                .and_then(async |chunk| Ok(Event::default().json_data(chunk)?))
+                .inspect_err(|err| {
+                    error!(%err, "sse stream error happened");
+                });
 
-                        let sse = Sse::new(adapter);
+                let sse = Sse::new(resp_iter);
 
-                        Ok(sse.into_response())
-                    }
-                };
+                Ok(sse.into_response())
             }
-
-            None => {}
-        }
+        };
     }
 
     match state
@@ -271,9 +135,43 @@ async fn forward_request<T: Serialize + 'static>(
         Ok(response) => {
             let status = response.status();
             let headers = response.headers().clone();
-            let body = response.bytes_stream();
-            let body = Body::from_stream(body);
 
+            let data = match response.bytes().await {
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(err.to_string()))
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+
+                Ok(data) => data,
+            };
+
+            let mut value = match serde_json::from_slice::<Value>(&data) {
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(err.to_string()))
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+
+                Ok(value) => value,
+            };
+
+            insert_index(&mut value);
+
+            let data = match serde_json::to_vec(&value) {
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(err.to_string()))
+                        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+                }
+
+                Ok(data) => data,
+            };
+
+            let body = Body::from(data);
             let mut builder = Response::builder().status(status);
 
             for (k, v) in headers {
@@ -292,6 +190,198 @@ async fn forward_request<T: Serialize + 'static>(
             .body(Body::from(err.to_string()))
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
     }
+}
+
+async gen fn supplement_tool_call_fields(
+    adapter: StreamAsyncIterAdapter<impl Stream<Item = anyhow::Result<Chunk>>>,
+) -> anyhow::Result<Chunk> {
+    let mut tool_call_id = None;
+    let mut tool_call_index = None;
+    let mut function_name = None;
+
+    for await chunk in adapter {
+        let mut chunk: Chunk = match chunk {
+            Err(err) => {
+                yield Err(err);
+                return;
+            }
+
+            Ok(chunk) => chunk,
+        };
+
+        let choice = match chunk.choices.first_mut() {
+            None => {
+                yield Ok(chunk);
+                continue;
+            }
+            Some(choice) => choice,
+        };
+
+        let delta = match choice.get_mut("delta") {
+            None => {
+                yield Ok(chunk);
+                continue;
+            }
+            Some(delta) => delta,
+        };
+
+        let tool_calls = match delta.get_mut("tool_calls") {
+            None => {
+                yield Ok(chunk);
+                continue;
+            }
+
+            Some(tool_calls) => match tool_calls.as_array_mut() {
+                None => {
+                    yield Ok(chunk);
+                    continue;
+                }
+                Some(tool_calls) => tool_calls,
+            },
+        };
+
+        debug!(?tool_calls, "found tool calls");
+
+        let tool_call = match tool_calls.first_mut() {
+            None => {
+                yield Ok(chunk);
+                continue;
+            }
+
+            Some(tool_call) => match tool_call.as_object_mut() {
+                None => {
+                    yield Ok(chunk);
+                    continue;
+                }
+
+                Some(tool_call) => tool_call,
+            },
+        };
+
+        debug!(?tool_call, "found tool call");
+
+        match (&mut tool_call_id, tool_call.get_mut("id")) {
+            (None, Some(id)) => match id.as_str() {
+                None => {}
+
+                Some(id) => {
+                    tool_call_id = Some(id.to_string());
+
+                    debug!(%id, "store tool call id");
+                }
+            },
+
+            (Some(id), None) => {
+                tool_call.insert("id".to_string(), id.as_str().into());
+
+                debug!(?tool_call, "supplement tool call id");
+            }
+
+            (None, None) => {
+                debug!(?tool_call, "no tool call id");
+            }
+
+            (Some(tool_call_id), Some(id)) if id.as_str() == Some("") => {
+                tool_call.insert("id".to_string(), tool_call_id.as_str().into());
+
+                debug!(?tool_call, "replace tool call empty id");
+            }
+
+            (tool_call_id, id) => {
+                debug!(?tool_call_id, ?id, "other id state");
+            }
+        }
+
+        match (tool_call_index, tool_call.get_mut("index")) {
+            (None, Some(index)) => match index.as_i64() {
+                None => {}
+
+                Some(index) => {
+                    tool_call_index = Some(index);
+
+                    debug!(%index, "store tool call index");
+                }
+            },
+
+            (Some(index), None) => {
+                tool_call.insert("index".to_string(), index.into());
+
+                debug!(?tool_call, "supplement tool call index");
+            }
+
+            (None, None) => {
+                tool_call_index = Some(0);
+                tool_call.insert("index".to_string(), 0.into());
+
+                debug!(?tool_call, "supplement tool call index default 0");
+            }
+
+            (tool_call_index, index) => {
+                debug!(?tool_call_index, ?index, ?index, "other index state");
+            }
+        }
+
+        let function = match tool_call
+            .get_mut("function")
+            .and_then(|function| function.as_object_mut())
+        {
+            None => {
+                yield Ok(chunk);
+                continue;
+            }
+
+            Some(function) => function,
+        };
+
+        match (&mut function_name, function.get_mut("name")) {
+            (None, Some(name)) => match name.as_str() {
+                None => {}
+
+                Some(name) => {
+                    function_name = Some(name.to_string());
+
+                    debug!(%name, "store tool call name");
+                }
+            },
+
+            (Some(name), None) => {
+                function.insert("name".to_string(), name.as_str().into());
+
+                debug!(?function, "supplement tool call name");
+            }
+
+            (None, None) => {
+                debug!(?function, "no tool call name");
+            }
+
+            (Some(function_name), Some(name)) if name.as_str() == Some("") => {
+                function.insert("name".to_string(), function_name.as_str().into());
+
+                debug!(?tool_call, "replace tool call empty name");
+            }
+
+            (function_name, name) => {
+                debug!(?function_name, ?name, "other name state");
+            }
+        }
+
+        yield Ok(chunk);
+    }
+}
+
+fn insert_index(value: &mut Value) -> Option<()> {
+    value
+        .get_mut("choices")?
+        .as_array_mut()?
+        .first_mut()?
+        .get_mut("tool_calls")?
+        .as_array_mut()?
+        .first_mut()?
+        .as_object_mut()?
+        .entry("index")
+        .or_insert(0.into());
+
+    Some(())
 }
 
 fn retain_headers(headers: HeaderMap) -> HeaderMap {
@@ -358,8 +448,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     info!("starting openai limiter");
 
-    let bpe = o200k_base()?;
-
     let cors = CorsLayer::new()
         // allow `GET` and `POST` when accessing the resource
         .allow_methods([Method::GET, Method::POST])
@@ -370,11 +458,11 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route(
-            "/v1/completions",
+            "/completions",
             post(handle_completion).fallback(proxy_handler),
         )
         .route(
-            "/v1/chat/completions",
+            "/chat/completions",
             post(handle_chat).fallback(proxy_handler),
         )
         .fallback(proxy_handler)
@@ -382,9 +470,6 @@ pub async fn run() -> anyhow::Result<()> {
         .with_state(Arc::new(ServerState {
             backend: cli.backend.parse()?,
             client: Default::default(),
-            input_max_token: cli.input_max_token,
-            bpe,
-            cot_parser: cli.cot_parser,
         }));
 
     let listener = TcpListener::bind(cli.listen).await?;
