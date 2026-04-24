@@ -47,6 +47,7 @@ struct ServerState {
 #[instrument(err(Debug))]
 async fn handle_completion(
     state: State<Arc<ServerState>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(payload): Json<HashMap<String, Value>>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -55,20 +56,13 @@ async fn handle_completion(
         .and_then(|stream| stream.as_bool())
         .unwrap_or_default();
 
-    forward_request(
-        state,
-        "v1/completions",
-        Method::POST,
-        headers,
-        stream,
-        payload,
-    )
-    .await
+    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
 }
 
 #[instrument(err(Debug))]
 async fn handle_chat(
     state: State<Arc<ServerState>>,
+    uri: Uri,
     headers: HeaderMap,
     Json(payload): Json<HashMap<String, Value>>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -77,15 +71,7 @@ async fn handle_chat(
         .and_then(|stream| stream.as_bool())
         .unwrap_or_default();
 
-    forward_request(
-        state,
-        "chat/completions",
-        Method::POST,
-        headers,
-        stream,
-        payload,
-    )
-    .await
+    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
 }
 
 #[instrument(err(Debug), skip(body))]
