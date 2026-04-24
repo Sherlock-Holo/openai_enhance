@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::Uri;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::{
-    Json, Router,
+    Router,
     http::{HeaderMap, Method, StatusCode, header},
     routing::post,
 };
@@ -42,36 +42,6 @@ use crate::sse::{Chunk, send_stream_request};
 struct ServerState {
     backend: Url,
     client: Client,
-}
-
-#[instrument(err(Debug))]
-async fn handle_completion(
-    state: State<Arc<ServerState>>,
-    uri: Uri,
-    headers: HeaderMap,
-    Json(payload): Json<HashMap<String, Value>>,
-) -> Result<Response, (StatusCode, String)> {
-    let stream = payload
-        .get("stream")
-        .and_then(|stream| stream.as_bool())
-        .unwrap_or_default();
-
-    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
-}
-
-#[instrument(err(Debug))]
-async fn handle_chat(
-    state: State<Arc<ServerState>>,
-    uri: Uri,
-    headers: HeaderMap,
-    Json(payload): Json<HashMap<String, Value>>,
-) -> Result<Response, (StatusCode, String)> {
-    let stream = payload
-        .get("stream")
-        .and_then(|stream| stream.as_bool())
-        .unwrap_or_default();
-
-    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
 }
 
 #[instrument(err(Debug), skip(body))]
@@ -226,7 +196,7 @@ async gen fn supplement_tool_call_fields(
             },
         };
 
-        debug!(?tool_calls, "found tool calls");
+        info!(?tool_calls, "found tool calls");
 
         let tool_call = match tool_calls.first_mut() {
             None => {
@@ -244,7 +214,7 @@ async gen fn supplement_tool_call_fields(
             },
         };
 
-        debug!(?tool_call, "found tool call");
+        info!(?tool_call, "found tool call");
 
         match (&mut tool_call_id, tool_call.get_mut("id")) {
             (None, Some(id)) => match id.as_str() {
@@ -260,21 +230,21 @@ async gen fn supplement_tool_call_fields(
             (Some(id), None) => {
                 tool_call.insert("id".to_string(), id.as_str().into());
 
-                debug!(?tool_call, "supplement tool call id");
+                info!(?tool_call, "supplement tool call id");
             }
 
             (None, None) => {
-                debug!(?tool_call, "no tool call id");
+                info!(?tool_call, "no tool call id");
             }
 
             (Some(tool_call_id), Some(id)) if id.as_str() == Some("") => {
                 tool_call.insert("id".to_string(), tool_call_id.as_str().into());
 
-                debug!(?tool_call, "replace tool call empty id");
+                info!(?tool_call, "replace tool call empty id");
             }
 
             (tool_call_id, id) => {
-                debug!(?tool_call_id, ?id, "other id state");
+                info!(?tool_call_id, ?id, "other id state");
             }
         }
 
@@ -285,25 +255,25 @@ async gen fn supplement_tool_call_fields(
                 Some(index) => {
                     tool_call_index = Some(index);
 
-                    debug!(%index, "store tool call index");
+                    info!(%index, "store tool call index");
                 }
             },
 
             (Some(index), None) => {
                 tool_call.insert("index".to_string(), index.into());
 
-                debug!(?tool_call, "supplement tool call index");
+                info!(?tool_call, "supplement tool call index");
             }
 
             (None, None) => {
                 tool_call_index = Some(0);
                 tool_call.insert("index".to_string(), 0.into());
 
-                debug!(?tool_call, "supplement tool call index default 0");
+                info!(?tool_call, "supplement tool call index default 0");
             }
 
             (tool_call_index, index) => {
-                debug!(?tool_call_index, ?index, ?index, "other index state");
+                info!(?tool_call_index, ?index, ?index, "other index state");
             }
         }
 
@@ -333,21 +303,21 @@ async gen fn supplement_tool_call_fields(
             (Some(name), None) => {
                 function.insert("name".to_string(), name.as_str().into());
 
-                debug!(?function, "supplement tool call name");
+                info!(?function, "supplement tool call name");
             }
 
             (None, None) => {
-                debug!(?function, "no tool call name");
+                info!(?function, "no tool call name");
             }
 
             (Some(function_name), Some(name)) if name.as_str() == Some("") => {
                 function.insert("name".to_string(), function_name.as_str().into());
 
-                debug!(?tool_call, "replace tool call empty name");
+                info!(?tool_call, "replace tool call empty name");
             }
 
             (function_name, name) => {
-                debug!(?function_name, ?name, "other name state");
+                info!(?function_name, ?name, "other name state");
             }
         }
 
@@ -375,9 +345,129 @@ fn retain_headers(headers: HeaderMap) -> HeaderMap {
         .into_iter()
         .filter_map(|(k, v)| match k {
             Some(header::AUTHORIZATION) => Some((header::AUTHORIZATION, v)),
-            _ => None,
+            Some(header::HOST) => None,
+
+            Some(k) => Some((k, v)),
+            None => None,
         })
         .collect::<HeaderMap>()
+}
+
+async fn proxy_handler_with_bytes(
+    state: State<Arc<ServerState>>,
+    method: Method,
+    req_uri: Uri,
+    headers: HeaderMap,
+    body_bytes: bytes::Bytes,
+) -> Result<Response, (StatusCode, String)> {
+    let mut url = state.backend.clone();
+    url.set_path(req_uri.path());
+
+    let response = match state
+        .client
+        .request(method, url)
+        .headers(headers)
+        .body(body_bytes)
+        .send()
+        .await
+    {
+        Err(err) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(err.to_string()))
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+        Ok(resp) => resp,
+    };
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = Body::from_stream(response.bytes_stream());
+    let mut builder = Response::builder().status(status);
+
+    for (k, v) in headers {
+        if let Some(k) = k {
+            builder = builder.header(k, v);
+        }
+    }
+
+    builder
+        .body(body)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+#[instrument(err(Debug))]
+async fn handle_all_completions(
+    state: State<Arc<ServerState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, (StatusCode, String)> {
+    debug!("start handle all completions");
+
+    let path = uri.path();
+
+    if path.ends_with("chat/completions") {
+        let body_bytes = match to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(err) => return Err((StatusCode::BAD_REQUEST, err.to_string())),
+        };
+
+        let payload = match serde_json::from_slice::<HashMap<String, Value>>(&body_bytes) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return proxy_handler_with_bytes(state, Method::POST, uri, headers, body_bytes)
+                    .await;
+            }
+        };
+
+        handle_chat_suffix(state, uri, headers, payload).await
+    } else if path.ends_with("completions") {
+        let body_bytes = match to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(err) => return Err((StatusCode::BAD_REQUEST, err.to_string())),
+        };
+
+        let payload = match serde_json::from_slice::<HashMap<String, Value>>(&body_bytes) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return proxy_handler_with_bytes(state, Method::POST, uri, headers, body_bytes)
+                    .await;
+            }
+        };
+
+        handle_completion_suffix(state, uri, headers, payload).await
+    } else {
+        proxy_handler(state, Method::POST, uri, headers, body).await
+    }
+}
+
+async fn handle_chat_suffix(
+    state: State<Arc<ServerState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    payload: HashMap<String, Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let stream = payload
+        .get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or_default();
+
+    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
+}
+
+async fn handle_completion_suffix(
+    state: State<Arc<ServerState>>,
+    uri: Uri,
+    headers: HeaderMap,
+    payload: HashMap<String, Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let stream = payload
+        .get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or_default();
+
+    forward_request(state, uri.path(), Method::POST, headers, stream, payload).await
 }
 
 #[instrument(err(Debug), skip(body))]
@@ -388,6 +478,8 @@ async fn proxy_handler(
     mut headers: HeaderMap,
     body: Body,
 ) -> Result<Response, (StatusCode, String)> {
+    debug!("start proxy handler");
+
     headers = retain_headers(headers);
 
     let mut url = state.backend.clone();
@@ -444,12 +536,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route(
-            "/completions",
-            post(handle_completion).fallback(proxy_handler),
-        )
-        .route(
-            "/chat/completions",
-            post(handle_chat).fallback(proxy_handler),
+            "/{*path}",
+            post(handle_all_completions).fallback(proxy_handler),
         )
         .fallback(proxy_handler)
         .layer(cors)
